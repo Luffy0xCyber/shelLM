@@ -1,57 +1,145 @@
-# shelLM
+# Intro
+During my "Vulnerability" course, I had to find a honeypot, configure it, and deploy it! I was aware of other honeypots such as "Cowrie" but I wanted something different and new. As I am a person who is passionate about AI, how it works, LLM languages and so on... I found "SheLLM" to be a really good project. It was also my first time discovering a honeypot based on AI responses... So fascinating. I dove into this project easily.
 
-The `shelLM` honeypot suite creates interactive, dynamic, and realistic honeypots through the use of Large Language Models (LLMs). The `shelLM` tool was created from a research project to show the effectiveness of dynamic fake file systems and command responses to keep attackers trapped longer, thus increasing the intelligence collected.
+# Scenario, deployment, personalization 
+## Scenario 
+So in order to make the project more realistic, I decided to create a whole realistic attack scenario. I imagined a corporation that has its website (yes I even faked a website) and in the website it has a link to their GitHub repo. And in the commits of one of the projects on GitHub, there is a "Git commit leaking SSH keys". Now how did I make this "SheLLM" have an IP address available to the public? And how did I personalize it? Scripts for alerts? etc...
 
-The extension of shelLM to a larger deception framework we call VelLMes can be found here: https://github.com/stratosphereips/VelLMes-AI-Honeypot/tree/main
+Some context: the name of the company was `Build Pro`, a company specialized in construction and building, and the user we want to use as a honeypot user is Kaiser (an engineer who works at Build Pro company).
 
-## Features
+## How did I manage it?
 
-`shelLM` was developed in Python and currently uses Open AI GPT models. Among its key features are:
+### VM Preparation:
 
-1. The content from a previous session is carried over to a new session to ensure consistency.
-2. It uses a combination of techniques for prompt engineering, including chain-of-thought.
-3. Uses prompts with precise instructions to address common LLM problems.
-4. More creative file and directory names
-5. Allows users to "move" through folders
-6. Response is correct also for non-commands.
-7. sudo command not allowed
 
-## Installation
+- Installation of an Ubuntu 22.04 LTS virtual machine in bridge mode to
+expose it on the local network. To configure the VM, simply follow this tutorial: https://linuxsimply.com/linux-basics/os-installation/virtual-machine/ubuntu-on-vmware/ ; the installation was done on VMware.
 
-The installation steps are as follows:
-
-```bash
-~$ # Install requirements
-~$ pip install -r requirements.txt
-~$
-~$ # Create env file
-~$ cp env_TEMPLATE .env
-~$ # Edit env file to add OPEN AI API KEY
-~$ vim .env
+- Creation of the kaiser user:
+```sh
+sudo adduser kaiser
+sudo usermod --shell /usr/local/bin/shelLM-kaiser kaiser
 ```
 
-## Usage
-
-Run `shelLM` with the following command:
+- The user was added to the AllowUsers list in `/etc/ssh/sshd_config` to
+limit SSH access:
+```sh
+AllowUsers kaiser
 ```
-~$ python3 LinuxSSHbot.py 
+- Restart of the SSH service -> `sudo systemctl restart sshd`
+
+
+### Installation and configuration of shelLM
+
+- Creation of the .env file with the OpenAI API key:
+`echo 'OPENAI_API_KEY="sk-…"' | sudo tee /opt/shelLM-kaiser/.env`
+- Installation of Python dependencies and other dependencies like `jq` and `dos2unix`(conversion of files to UNIX format to avoid errors)...:
+```sh
+pip3 install -r requirements.txt
+sudo apt install -y git python3-pip dos2unix jq
 ```
-![image](https://github.com/stratosphereips/shelLM/assets/2458879/021bcd0d-93ae-49aa-b3a3-dea345dffc7c)
 
-## FAQ
+- Assignment of permissions to the folder:
+```sh
+sudo chown -R kaiser:kaiser /opt/shelLM-kaiser
+sudo chmod 600 /opt/shelLM-kaiser/.env
+sudo chown kaiser:kaiser /opt/shelLM-kaiser/.env
+```
 
-**What services does shelLM uses?**
+- Creation of the fake shell (shelLM-Kaiser):
+```sh
+sudo tee /usr/local/bin/shelLM-kaiser <<'EOF'
+#!/usr/bin/env bash
+cd /opt/shelLM-kaiser
+exec python3 LinuxSSHbot.py
+EOF
+sudo chmod +x /usr/local/bin/shelLM-kaiser
+sudo chown root:root /usr/local/bin/shelLM-kaiser
+```
 
-This version of shelLM can simulate an SSH honeypot.
+This shell simulates a complete Linux session controlled by an LLM. Add the
+shell to the list of authorized shells:
+```sh
+echo "/usr/local/bin/shelLM-kaiser" | sudo tee -a /etc/shells
+```
+- Personality customization. In the `personalitySSH.yml` file, the following elements were configured:
+    - Username: kaiser
+    - Host: buildpro
+    - Directories: Blueprints, Contracts, SitePlans, etc.
+    - Realistic terminal behavior (errors on sudo, credible files, response
+    only to real Linux commands).
 
-**Are you planning on supporting other services?**
 
-Yes. This is part of ongoing research focused on more services.
+### Session logging and monitoring
 
-**Is this just a wrapper for Open AI?**
+By default, shelLM records the commands typed by the attacker in a file called
+`history.txt`. But this file is not very usable as is:
 
-No. The core of the tool are the Prompts, that have been engineered specially to guarantee a correct behavior. Also shelLM provides other features like session management, error handling, log storage, and other key features needed in honeypots.
 
-# About
+- It also contains all the honeypot configuration (personalitySSH.yml) at the
+    beginning of the file.
+- It is difficult to read the logs properly.
+- And especially, the IP address displayed comes from a fake "Last login" line generated by
+the model, so not reliable at all.
 
-This tool was developed at the Stratosphere Laboratory at the Czech Technical University in Prague.
+
+To fix this, I wrote a Python script called `shelLM-logcleaner.py`. This script runs
+continuously and cleans up `history.txt`:
+- It retrieves only the useful lines (the commands executed by
+the attacker with their timestamp).
+- It rewrites them cleanly in another file: `/var/log/shelLM/sessions.log`.
+
+
+Now, the final format is simple and readable. But this script does not retrieve the IP address, because like i said `history.txt` does not contain the real IP of
+the attacker. Moreover, for this script to run all the time, a systemd service was created.
+Here is its configuration:
+```sh
+[Unit]
+Description=Convert shelLM history to session log
+After=network.target
+[Service]
+User=kaiser
+ExecStart=/usr/local/bin/shelLM-logcleaner.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
+```
+
+This service allows the script to start automatically at each machine boot.
+It is activated with these commands:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now shelLM-logcleaner.service
+```
+Since `logcleaner.py` does not handle the IP, I created a second script, this time in Bash, which
+takes care of sending the logs to Discord. This script monitors two files in real time:
+- `/var/log/auth.log` → this file contains the real SSH connections of the system
+(successful or failed).
+- `/var/log/shelLM/sessions.log` → the cleaned commands.
+
+Operation:
+- When a user connects via SSH (or fails their password), the IP is
+detected and stored.
+- When a command is executed, it is sent to a Discord webhook
+with the last known IP.
+- Everything is sent in a clear message, with a small emoji to identify the type
+of action (connection, error, command, disconnection...).
+
+
+<br>
+
+# Contact
+
+Feel free to reach out via :
+
+Email: elfaijahanas@gmail.com
+LinkedIn : https://www.linkedin.com/in/anaselfaijah/
+
+
+
+<br>
+
+
+# Credit
+
+This honeypot implementation uses SheLLM by Sladic, M., Valeros, V., Catania, C., & Garcia, S. (2023) (Stratosphere Laboratory, CTU Prague) as its base framework, with custom modifications for enhanced logging and monitoring capabilities. https://github.com/stratosphereips/SheLLM
